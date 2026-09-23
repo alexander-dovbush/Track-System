@@ -1,6 +1,9 @@
 // brings in EF Core tools (DbContext, DbContextOptions)
 using Microsoft.EntityFrameworkCore;
 
+// Lets this file see the Employee class from the Models folder
+using TrackSystem.Api.Models;
+
 // the "address" of this class, so Program.cs can find it with: using TrackSystem.Api.Data;
 namespace TrackSystem.Api.Data;
 
@@ -12,5 +15,6 @@ public class AppDbContext : DbContext
     // ": base(options)" passes the options to EF Core's DbContext so it knows where to connect
     public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
 
-    // (empty for now. In step 3 we add the tables here, e.g. Employees)
+    // dbo.Employees table -> collection of Employee objects we can query
+    public DbSet<Employee> Employees => Set<Employee>();
 }

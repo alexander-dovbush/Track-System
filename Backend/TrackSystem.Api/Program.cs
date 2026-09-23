@@ -28,5 +28,32 @@ app.MapGet("/api/db-check", async (AppDbContext db) =>
     return new { database = canConnect ? "connected" : "failed" };
 });
 
+// GET /api/employees -> list of all employees as JSON (no passwords)
+app.MapGet("/api/employees", async (AppDbContext db) =>
+{
+    // dbo.Employees rows -> only the safe columns (Password is left out)
+    var employees = await db.Employees
+        .Select(e => new
+        {
+            e.ENum,
+            e.FirstName,
+            e.LastName,
+            e.Email,
+            e.UserName,
+            e.Position,
+            e.Role,
+            e.TeamNum,
+            e.Status,
+            e.IsFirstLogin,
+            e.FailedLoginAttempts,
+            e.LockoutEnd
+        })
+        // run the query -> List of employees
+        .ToListAsync();
+
+    // list -> HTTP 200 with JSON body
+    return Results.Ok(employees);
+});
+
 // starts the server → waits for requests (stop with Ctrl+C)
 app.Run();
