@@ -17,4 +17,7 @@ public class AppDbContext : DbContext
 
     // dbo.Employees table -> collection of Employee objects we can query
     public DbSet<Employee> Employees => Set<Employee>();
+
+    // dbo.LoginLogs table -> collection of LoginLog objects we can add to and query
+    public DbSet<LoginLog> LoginLogs => Set<LoginLog>();
 }

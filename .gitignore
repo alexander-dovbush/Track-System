@@ -21,6 +21,7 @@ pnpm-debug.log*
 artifacts/
 
 # ---- Secrets / local config ----
+*.http
 .env
 .env.*
 !.env.example
