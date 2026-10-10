@@ -71,8 +71,24 @@ builder.Services.AddAuthentication("Bearer")
 // registers the rules system -> lets endpoints say "a valid token is required"
 builder.Services.AddAuthorization();
 
+// "Cors:AllowedOrigins" from appsettings.json -> ["http://localhost:5173"] (empty list if missing)
+var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
+
+// registers a CORS policy named "ReactApp" -> the rules for browser calls from other origins
+builder.Services.AddCors(options =>
+    options.AddPolicy("ReactApp", policy =>
+        // only these origins are allowed -> any other site's browser call is blocked
+        policy.WithOrigins(allowedOrigins)
+            // any header -> lets React send "Content-Type: application/json" and "Authorization: Bearer ..."
+            .AllowAnyHeader()
+            // any method -> GET, POST, PUT, DELETE
+            .AllowAnyMethod()));
+
 // input: the setup → output: app = the ready server
 var app = builder.Build();
+
+// every request -> if it comes from an allowed origin, add the "Access-Control-Allow-Origin" header to the answer
+app.UseCors("ReactApp");
 
 // every request -> reads "Authorization: Bearer <token>" (if any), checks it, remembers who is calling
 app.UseAuthentication();
