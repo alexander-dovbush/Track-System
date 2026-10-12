@@ -2,16 +2,20 @@
 using Microsoft.EntityFrameworkCore;
 // brings in our AppDbContext class from the Data folder
 using TrackSystem.Api.Data;
-// lets Program.cs see LoginRequest from the Dtos folder
+// lets Program.cs see LoginRequest, ChangePasswordRequest from the Dtos folder
 using TrackSystem.Api.Dtos;
 // lets Program.cs see LoginLog from the Models folder
 using TrackSystem.Api.Models;
+// lets Program.cs see PasswordRules from the Security folder
+using TrackSystem.Api.Security;
 // Claim, ClaimsIdentity -> the data pieces inside a token
 using System.Security.Claims;
 // JsonWebTokenHandler -> creates the token text
 using Microsoft.IdentityModel.JsonWebTokens;
 // SymmetricSecurityKey, SigningCredentials, SecurityTokenDescriptor -> key + signing tools
 using Microsoft.IdentityModel.Tokens;
+// AuthorizationPolicyBuilder -> builds the access rules (policies)
+using Microsoft.AspNetCore.Authorization;
 
 // input: settings (appsettings.json + User Secrets) → output: builder = the setup area
 var builder = WebApplication.CreateBuilder(args);
@@ -68,8 +72,18 @@ builder.Services.AddAuthentication("Bearer")
         };
     });
 
-// registers the rules system -> lets endpoints say "a valid token is required"
-builder.Services.AddAuthorization();
+// registers the rules system + our two rules (default and "PasswordChange")
+builder.Services.AddAuthorization(options =>
+{
+    // default rule for every .RequireAuthorization() -> valid token AND password already changed (else 403)
+    options.DefaultPolicy = new AuthorizationPolicyBuilder()
+        .RequireAuthenticatedUser()
+        .RequireClaim("mustChangePassword", "false")
+        .Build();
+
+    // rule "PasswordChange" -> a valid token is enough (mustChangePassword may be "true")
+    options.AddPolicy("PasswordChange", policy => policy.RequireAuthenticatedUser());
+});
 
 // "Cors:AllowedOrigins" from appsettings.json -> ["http://localhost:5173"] (empty list if missing)
 var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
@@ -92,8 +106,39 @@ app.UseCors("ReactApp");
 
 // every request -> reads "Authorization: Bearer <token>" (if any), checks it, remembers who is calling
 app.UseAuthentication();
+
 // every request -> applies the rules (e.g. RequireAuthorization) using what UseAuthentication found
 app.UseAuthorization();
+
+// employee -> signed JWT text with sub, role, mustChangePassword (used by login and change-password)
+string CreateToken(Employee employee)
+{
+    // the "recipe" for the token: what's inside, who made it, who it's for, until when, how to sign
+    var tokenDescriptor = new SecurityTokenDescriptor
+    {
+        // claims = the data inside the token (readable by anyone -> no secrets here!)
+        Subject = new ClaimsIdentity(new[]
+        {
+            // "sub" (subject) = who this token belongs to -> the eNum
+            new Claim("sub", employee.ENum.ToString()),
+            // "role" -> Employee / Manager / Admin (used later to allow or deny endpoints)
+            new Claim("role", employee.Role),
+            // "mustChangePassword" -> "true" on first login, "false" after
+            new Claim("mustChangePassword", employee.IsFirstLogin.ToString().ToLower())
+        }),
+        // "TrackSystem.Api" -> written into the token as "iss"
+        Issuer = jwtIssuer,
+        // "TrackSystem.Client" -> written into the token as "aud"
+        Audience = jwtAudience,
+        // now (UTC) + 60 min -> written into the token as "exp"
+        Expires = DateTime.UtcNow.AddMinutes(jwtExpiresMinutes),
+        // our secret key + HMAC-SHA256 -> how the signature is made
+        SigningCredentials = new SigningCredentials(signingKey, SecurityAlgorithms.HmacSha256)
+    };
+
+    // recipe -> the token text "xxxxx.yyyyy.zzzzz"
+    return new JsonWebTokenHandler().CreateToken(tokenDescriptor);
+}
 
 // input: GET /api/health → output: {"status":"ok"}   (from step 1, unchanged)
 app.MapGet("/api/health", () => new { status = "ok" });
@@ -135,7 +180,7 @@ app.MapGet("/api/employees", async (AppDbContext db) =>
     // list -> HTTP 200 with JSON body
     return Results.Ok(employees);
 })
-// no valid token -> 401, the code above never runs
+// default rule: valid token AND password already changed -> else 401 (no/bad token) or 403 (must change first)
 .RequireAuthorization();
 
 // POST /api/auth/login, body {"eNum":1,"password":"..."} -> 200 (ok), 401 (generic error) or 423 (locked)
@@ -230,31 +275,8 @@ app.MapPost("/api/auth/login", async (LoginRequest request, AppDbContext db, Htt
     // employee changes + log row -> saved together
     await db.SaveChangesAsync();
 
-    // the "recipe" for the token: what's inside, who made it, who it's for, until when, how to sign
-    var tokenDescriptor = new SecurityTokenDescriptor
-    {
-        // claims = the data inside the token (readable by anyone -> no secrets here!)
-        Subject = new ClaimsIdentity(new[]
-        {
-            // "sub" (subject) = who this token belongs to -> the eNum
-            new Claim("sub", employee.ENum.ToString()),
-            // "role" -> Employee / Manager / Admin (used later to allow or deny endpoints)
-            new Claim("role", employee.Role),
-            // "mustChangePassword" -> "true" on first login, "false" after
-            new Claim("mustChangePassword", employee.IsFirstLogin.ToString().ToLower())
-        }),
-        // "TrackSystem.Api" -> written into the token as "iss"
-        Issuer = jwtIssuer,
-        // "TrackSystem.Client" -> written into the token as "aud"
-        Audience = jwtAudience,
-        // now (UTC) + 60 min -> written into the token as "exp"
-        Expires = DateTime.UtcNow.AddMinutes(jwtExpiresMinutes),
-        // our secret key + HMAC-SHA256 -> how the signature is made
-        SigningCredentials = new SigningCredentials(signingKey, SecurityAlgorithms.HmacSha256)
-    };
-
-    // recipe -> the token text "xxxxx.yyyyy.zzzzz"
-    var token = new JsonWebTokenHandler().CreateToken(tokenDescriptor);
+    // employee -> token text (sub, role, mustChangePassword, 60 min)
+    var token = CreateToken(employee);
 
     // -> 200 with the token (React will save it) + whether the user must change the password
     return Results.Ok(new
@@ -265,6 +287,55 @@ app.MapPost("/api/auth/login", async (LoginRequest request, AppDbContext db, Htt
         token
     });
 });
+
+// POST /api/auth/change-password (valid token required), body {"currentPassword":"...","newPassword":"..."}
+// -> 200 {message, mustChangePassword, token} or 400 {message}
+app.MapPost("/api/auth/change-password", async (ChangePasswordRequest request, AppDbContext db, ClaimsPrincipal user) =>
+{
+    // "sub" claim from the token -> eNum as a number; missing or not a number -> 401
+    if (!int.TryParse(user.FindFirst("sub")?.Value, out var eNum))
+        return Results.Unauthorized();
+
+    // eNum -> the Employee row, or null if it was deleted after the token was made
+    var employee = await db.Employees.FirstOrDefaultAsync(e => e.ENum == eNum);
+    // no such employee -> 401 (token belongs to nobody now)
+    if (employee is null)
+        return Results.Unauthorized();
+
+        // current password empty or not matching the stored hash -> 400 (not 401: in React 401 means "bad token" -> logout)
+    if (string.IsNullOrEmpty(request.CurrentPassword) || !BCrypt.Net.BCrypt.Verify(request.CurrentPassword, employee.Password))
+        return Results.BadRequest(new { message = "Current password is incorrect" });
+
+    // new = current -> 400 (a "change" that changes nothing)
+    if (request.NewPassword == request.CurrentPassword)
+        return Results.BadRequest(new { message = "New password must be different from the current password" });
+
+    // new password -> first broken rule as text, or null if all rules pass
+    var ruleError = PasswordRules.Validate(request.NewPassword);
+    // a rule is broken -> 400 with that rule's message
+    if (ruleError is not null)
+        return Results.BadRequest(new { message = ruleError });
+
+    // new password -> BCrypt hash (with a fresh random salt) -> replaces the old hash
+    employee.Password = BCrypt.Net.BCrypt.HashPassword(request.NewPassword);
+    // first-login flag -> off (no more forced change)
+    employee.IsFirstLogin = false;
+    // both changes -> saved to dbo.Employees
+    await db.SaveChangesAsync();
+
+    // updated employee (IsFirstLogin = false) -> new token with mustChangePassword "false"
+    var token = CreateToken(employee);
+
+    // -> 200 with the new token (React will replace the old one with it)
+    return Results.Ok(new
+    {
+        message = "Password changed",
+        mustChangePassword = employee.IsFirstLogin,
+        token
+    });
+})
+// valid token required, even one with mustChangePassword = "true"
+.RequireAuthorization("PasswordChange");
 
 // starts the server → waits for requests (stop with Ctrl+C)
 app.Run();
