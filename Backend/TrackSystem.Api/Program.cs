@@ -16,6 +16,10 @@ using Microsoft.IdentityModel.JsonWebTokens;
 using Microsoft.IdentityModel.Tokens;
 // AuthorizationPolicyBuilder -> builds the access rules (policies)
 using Microsoft.AspNetCore.Authorization;
+// RateLimitPartition, FixedWindowRateLimiterOptions -> the counting tools
+using System.Threading.RateLimiting;
+// AddPolicy / RequireRateLimiting -> rate-limit rules for endpoints
+using Microsoft.AspNetCore.RateLimiting;
 
 // input: settings (appsettings.json + User Secrets) → output: builder = the setup area
 var builder = WebApplication.CreateBuilder(args);
@@ -31,8 +35,11 @@ var signingKey = new SymmetricSecurityKey(Convert.FromBase64String(jwtKey));
 var jwtIssuer = builder.Configuration["Jwt:Issuer"];
 var jwtAudience = builder.Configuration["Jwt:Audience"];
 
-// "Jwt:ExpiresMinutes" from appsettings.json -> 60 (as a number)
+// "Jwt:ExpiresMinutes" from appsettings.json -> 30 (as a number)
 var jwtExpiresMinutes = builder.Configuration.GetValue<int>("Jwt:ExpiresMinutes");
+
+// made once at startup: a real BCrypt hash of a throwaway text -> used only to waste the same time for unknown eNums
+var dummyHash = BCrypt.Net.BCrypt.HashPassword("dummy-password-for-equal-timing");
 
 // input: connection string "DefaultConnection" from appsettings.json
 // output: server now knows HOW to create an AppDbContext connected to SQL Server
@@ -63,7 +70,7 @@ builder.Services.AddAuthentication("Bearer")
 
             // "exp" must be in the future -> expired token = 401
             ValidateLifetime = true,
-            // no 5-minute grace period -> 60 minutes means exactly 60
+            // no 5-minute grace period -> 30 minutes means exactly 30
             ClockSkew = TimeSpan.Zero,
 
             // which claim is the user's id / role (the short names we kept with MapInboundClaims = false)
@@ -98,11 +105,40 @@ builder.Services.AddCors(options =>
             // any method -> GET, POST, PUT, DELETE
             .AllowAnyMethod()));
 
+            // registers the rate limiter + one rule "auth" (used by login and change-password)
+builder.Services.AddRateLimiter(options =>
+{
+    // over the limit -> 429 Too Many Requests (the default would be 503)
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    // rejected request (status already set to 429) -> body {"message": "..."} so React can show it
+    options.OnRejected = async (context, cancellationToken) =>
+        await context.HttpContext.Response.WriteAsJsonAsync(
+            new { message = "Too many attempts. Please wait a minute and try again." },
+            cancellationToken);
+
+    // rule "auth" -> every IP gets its own counter
+    options.AddPolicy("auth", http =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            // caller's IP -> the counter's name (no IP -> one shared "unknown" counter)
+            partitionKey: http.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            // 10 requests per 1-minute window, extra requests rejected at once (no waiting line)
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
+});
+
 // input: the setup → output: app = the ready server
 var app = builder.Build();
 
 // every request -> if it comes from an allowed origin, add the "Access-Control-Allow-Origin" header to the answer
 app.UseCors("ReactApp");
+
+// every request -> if its endpoint has a rate-limit rule, count it; over the limit -> 429
+app.UseRateLimiter();
 
 // every request -> reads "Authorization: Bearer <token>" (if any), checks it, remembers who is calling
 app.UseAuthentication();
@@ -130,7 +166,7 @@ string CreateToken(Employee employee)
         Issuer = jwtIssuer,
         // "TrackSystem.Client" -> written into the token as "aud"
         Audience = jwtAudience,
-        // now (UTC) + 60 min -> written into the token as "exp"
+        // now (UTC) + 30 min -> written into the token as "exp"
         Expires = DateTime.UtcNow.AddMinutes(jwtExpiresMinutes),
         // our secret key + HMAC-SHA256 -> how the signature is made
         SigningCredentials = new SigningCredentials(signingKey, SecurityAlgorithms.HmacSha256)
@@ -183,7 +219,7 @@ app.MapGet("/api/employees", async (AppDbContext db) =>
 // default rule: valid token AND password already changed -> else 401 (no/bad token) or 403 (must change first)
 .RequireAuthorization();
 
-// POST /api/auth/login, body {"eNum":1,"password":"..."} -> 200 (ok), 401 (generic error) or 423 (locked)
+// POST /api/auth/login, body {"eNum":1,"password":"..."} -> 200 (ok) or 401 (generic error, also when locked / not active)
 // every attempt -> one row in dbo.LoginLogs
 app.MapPost("/api/auth/login", async (LoginRequest request, AppDbContext db, HttpContext http) =>
 {
@@ -191,11 +227,6 @@ app.MapPost("/api/auth/login", async (LoginRequest request, AppDbContext db, Htt
     var loginFailed = Results.Json(
         new { message = "Invalid employee number or password" },
         statusCode: StatusCodes.Status401Unauthorized);
-
-    // locked answer -> status 423 so React can tell it apart from a wrong password
-    var accountLocked = Results.Json(
-        new { message = "Account is locked. Try again in 15 minutes." },
-        statusCode: StatusCodes.Status423Locked);
 
     // "Asia/Jerusalem" -> Israel time zone rules (summer/winter switch is automatic)
     var israelZone = TimeZoneInfo.FindSystemTimeZoneById("Asia/Jerusalem");
@@ -227,19 +258,22 @@ app.MapPost("/api/auth/login", async (LoginRequest request, AppDbContext db, Htt
     // no such employee -> log failure (eNum still recorded), save, generic error
     if (employee is null)
     {
+        // unknown eNum -> same slow check as a real one (result ignored) -> response time doesn't reveal it
+        BCrypt.Net.BCrypt.Verify(request.Password, dummyHash);
         AddLog(false);
         await db.SaveChangesAsync();
         return loginFailed;
     }
 
-    // lockoutEnd later than now -> log failure, save, locked (password not checked)
+    // lockoutEnd later than now -> log failure, save, generic error (the lock stays silent, per the spec)
     if (employee.LockoutEnd > DateTime.UtcNow)
     {
+        // same slow check as a normal attempt (result ignored) -> timing doesn't reveal the lock
+        BCrypt.Net.BCrypt.Verify(request.Password, dummyHash);
         AddLog(false);
         await db.SaveChangesAsync();
-        return accountLocked;
+        return loginFailed;
     }
-
     // typed password doesn't match the stored hash -> count this failure
     if (!BCrypt.Net.BCrypt.Verify(request.Password, employee.Password))
     {
@@ -257,13 +291,21 @@ app.MapPost("/api/auth/login", async (LoginRequest request, AppDbContext db, Htt
             employee.FailedLoginAttempts = 0;
             // employee changes + log row -> saved together
             await db.SaveChangesAsync();
-            // -> 423 locked
-            return accountLocked;
+            // -> generic 401 (account is now locked, but we don't say so)
+            return loginFailed;
         }
 
         // new count + log row -> saved together
         await db.SaveChangesAsync();
         // -> generic 401
+        return loginFailed;
+    }
+
+    // correct password, but status is not "active" (pending / inactive) -> log failure, save, generic error
+    if (!string.Equals(employee.Status, "active", StringComparison.OrdinalIgnoreCase))
+    {
+        AddLog(false);
+        await db.SaveChangesAsync();
         return loginFailed;
     }
 
@@ -275,7 +317,7 @@ app.MapPost("/api/auth/login", async (LoginRequest request, AppDbContext db, Htt
     // employee changes + log row -> saved together
     await db.SaveChangesAsync();
 
-    // employee -> token text (sub, role, mustChangePassword, 60 min)
+    // employee -> token text (sub, role, mustChangePassword, 30 min)
     var token = CreateToken(employee);
 
     // -> 200 with the token (React will save it) + whether the user must change the password
@@ -286,7 +328,10 @@ app.MapPost("/api/auth/login", async (LoginRequest request, AppDbContext db, Htt
         mustChangePassword = employee.IsFirstLogin,
         token
     });
-});
+})
+// rule "auth" -> max 10 requests per minute per IP, then 429
+.RequireRateLimiting("auth");
+
 
 // POST /api/auth/change-password (valid token required), body {"currentPassword":"...","newPassword":"..."}
 // -> 200 {message, mustChangePassword, token} or 400 {message}
@@ -335,6 +380,33 @@ app.MapPost("/api/auth/change-password", async (ChangePasswordRequest request, A
     });
 })
 // valid token required, even one with mustChangePassword = "true"
+.RequireAuthorization("PasswordChange")
+// rule "auth" -> max 10 requests per minute per IP (stops guessing the current password)
+.RequireRateLimiting("auth");
+
+// POST /api/auth/refresh (valid token required, no body) -> 200 {token, mustChangePassword} or 401
+// React calls it while the user is active -> a fresh 30-min token
+app.MapPost("/api/auth/refresh", async (AppDbContext db, ClaimsPrincipal user) =>
+{
+    // "sub" claim from the token -> eNum as a number; missing or not a number -> 401
+    if (!int.TryParse(user.FindFirst("sub")?.Value, out var eNum))
+        return Results.Unauthorized();
+
+    // eNum -> the Employee row as it is NOW in the DB
+    var employee = await db.Employees.FirstOrDefaultAsync(e => e.ENum == eNum);
+
+    // deleted or no longer "active" -> 401 (React sends the user to Login)
+    if (employee is null || !string.Equals(employee.Status, "active", StringComparison.OrdinalIgnoreCase))
+        return Results.Unauthorized();
+
+    // current DB state -> new token (same claims, new 30-min expiry)
+    return Results.Ok(new
+    {
+        token = CreateToken(employee),
+        mustChangePassword = employee.IsFirstLogin
+    });
+})
+// valid token required, also during first login (the change-password page must not expire while the user types)
 .RequireAuthorization("PasswordChange");
 
 // starts the server → waits for requests (stop with Ctrl+C)
