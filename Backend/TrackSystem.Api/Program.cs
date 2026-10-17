@@ -105,7 +105,9 @@ builder.Services.AddCors(options =>
             // any method -> GET, POST, PUT, DELETE
             .AllowAnyMethod()));
 
-            // registers the rate limiter + one rule "auth" (used by login and change-password)
+// "RateLimit:AuthPermitLimit" from appsettings.json -> 10 (tests set a big number); missing -> 10
+var authPermitLimit = builder.Configuration.GetValue("RateLimit:AuthPermitLimit", 10);
+// registers the rate limiter + one rule "auth" (used by login and change-password)
 builder.Services.AddRateLimiter(options =>
 {
     // over the limit -> 429 Too Many Requests (the default would be 503)
@@ -122,10 +124,10 @@ builder.Services.AddRateLimiter(options =>
         RateLimitPartition.GetFixedWindowLimiter(
             // caller's IP -> the counter's name (no IP -> one shared "unknown" counter)
             partitionKey: http.Connection.RemoteIpAddress?.ToString() ?? "unknown",
-            // 10 requests per 1-minute window, extra requests rejected at once (no waiting line)
+            // authPermitLimit requests per 1-minute window, extra requests rejected at once (no waiting line)
             factory: _ => new FixedWindowRateLimiterOptions
             {
-                PermitLimit = 10,
+                PermitLimit = authPermitLimit,
                 Window = TimeSpan.FromMinutes(1),
                 QueueLimit = 0
             }));
