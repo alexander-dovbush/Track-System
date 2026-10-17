@@ -8,6 +8,8 @@ using TrackSystem.Api.Dtos;
 using TrackSystem.Api.Models;
 // lets Program.cs see PasswordRules from the Security folder
 using TrackSystem.Api.Security;
+// lets Program.cs see IEmailSender / SmtpEmailSender from the Services folder
+using TrackSystem.Api.Services;
 // Claim, ClaimsIdentity -> the data pieces inside a token
 using System.Security.Claims;
 // JsonWebTokenHandler -> creates the token text
@@ -38,6 +40,16 @@ var jwtAudience = builder.Configuration["Jwt:Audience"];
 // "Jwt:ExpiresMinutes" from appsettings.json -> 30 (as a number)
 var jwtExpiresMinutes = builder.Configuration.GetValue<int>("Jwt:ExpiresMinutes");
 
+// "PasswordReset:TokenMinutes" from appsettings.json -> 30 (missing -> 30)
+var resetTokenMinutes = builder.Configuration.GetValue("PasswordReset:TokenMinutes", 30);
+
+// "PasswordReset:ResetPageUrl" from appsettings.json -> the React page the email links to; missing -> stop with a clear message
+var resetPageUrl = builder.Configuration["PasswordReset:ResetPageUrl"]
+    ?? throw new InvalidOperationException("PasswordReset:ResetPageUrl is missing in appsettings.json");
+
+// "PasswordReset:MinResponseMs" from appsettings.json -> 1500 (tests will set 0); missing -> 1500
+var resetMinResponseMs = builder.Configuration.GetValue("PasswordReset:MinResponseMs", 1500);
+
 // made once at startup: a real BCrypt hash of a throwaway text -> used only to waste the same time for unknown eNums
 var dummyHash = BCrypt.Net.BCrypt.HashPassword("dummy-password-for-equal-timing");
 
@@ -45,6 +57,9 @@ var dummyHash = BCrypt.Net.BCrypt.HashPassword("dummy-password-for-equal-timing"
 // output: server now knows HOW to create an AppDbContext connected to SQL Server
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+// someone asks for IEmailSender -> ASP.NET gives a SmtpEmailSender (tests swap it for a fake)
+builder.Services.AddScoped<IEmailSender, SmtpEmailSender>();
 
 // registers the JWT guard, named "Bearer" -> checks tokens sent as "Authorization: Bearer <token>"
 builder.Services.AddAuthentication("Bearer")
@@ -410,6 +425,137 @@ app.MapPost("/api/auth/refresh", async (AppDbContext db, ClaimsPrincipal user) =
 })
 // valid token required, also during first login (the change-password page must not expire while the user types)
 .RequireAuthorization("PasswordChange");
+
+// POST /api/auth/forgot-password (no token), body {"eNum":5} -> ALWAYS 200 with the same message
+// known + active employee -> reset link by email (part 2); anyone else -> nothing happens
+app.MapPost("/api/auth/forgot-password", async (ForgotPasswordRequest request, AppDbContext db, IEmailSender email, ILogger<Program> logger) =>
+{
+    // timer starts now -> measures how long this request has taken so far
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+    // wait until MinResponseMs has passed -> then the one fixed answer (same text and same time for every case)
+    async Task<IResult> SameAnswer()
+    {
+        // e.g. 1500 - 40 = 1460 ms still to wait; already slower than 1500 -> no wait
+        var waitMs = resetMinResponseMs - (int)stopwatch.ElapsedMilliseconds;
+        if (waitMs > 0)
+            await Task.Delay(waitMs);
+        return Results.Ok(new { message = "If the account exists, a reset link was sent to its email." });
+    }
+
+    // eNum -> the Employee row, or null if no such employee
+    var employee = await db.Employees.FirstOrDefaultAsync(e => e.ENum == request.ENum);
+
+    // unknown, or not "active" (pending / inactive can't log in anyway) -> no email, same answer
+    if (employee is null || !string.Equals(employee.Status, "active", StringComparison.OrdinalIgnoreCase))
+        return await SameAnswer();
+
+    // one "now" (UTC) for every time written below -> all consistent
+    var now = DateTime.UtcNow;
+
+    // this employee's links that were never used -> list (usually 0 or 1)
+    var oldTokens = await db.PasswordResetTokens
+        .Where(t => t.ENum == employee.ENum && t.UsedAt == null)
+        .ToListAsync();
+    // each old link -> usedAt = now (replaced) -> only the newest link will work
+    foreach (var old in oldTokens)
+        old.UsedAt = now;
+
+    // nothing -> token (goes in the email only) + its SHA-256 hash (goes in the DB)
+    var (token, tokenHash) = ResetTokens.Create();
+
+    // new row -> EF's "to save" list
+    db.PasswordResetTokens.Add(new PasswordResetToken
+    {
+        ENum = employee.ENum,
+        TokenHash = tokenHash,
+        CreatedAt = now,
+        // now + 30 min -> after this the link is dead
+        ExpiresAt = now.AddMinutes(resetTokenMinutes)
+    });
+    // old links' usedAt + the new row -> saved together (all or nothing)
+    await db.SaveChangesAsync();
+
+    // page URL + token -> "http://localhost:5173/reset-password?token=a3f0..."
+    var link = $"{resetPageUrl}?token={token}";
+    // first name from the DB -> HTML-safe text (a name like "<b>" can't break the email)
+    var firstName = System.Net.WebUtility.HtmlEncode(employee.FirstName);
+    // the email body (HTML) -> greeting, clickable link, expiry, "ignore if not you"
+    var body = $"""
+        <p>Hello {firstName},</p>
+        <p>We received a request to reset your Track-System password.</p>
+        <p><a href="{link}">Reset my password</a></p>
+        <p>This link works once, for {resetTokenMinutes} minutes. If you did not ask for this, ignore this email.</p>
+        """;
+
+    try
+    {
+        // employee's email from the DB -> email sent (Mailpit now, Gmail later)
+        await email.SendAsync(employee.Email, "Reset your Track-System password", body);
+    }
+    catch (Exception ex)
+    {
+        // mail server down / bad settings -> written to the API console, user still gets the same 200
+        logger.LogError(ex, "Reset email for eNum {ENum} could not be sent", employee.ENum);
+    }
+
+    // -> same answer as above
+    return await SameAnswer();
+})
+// rule "auth" -> max 10 per minute per IP (stops spamming someone's inbox and eNum scanning)
+.RequireRateLimiting("auth");
+
+// POST /api/auth/reset-password (no JWT), body {"token":"...","newPassword":"..."} -> 200 or 400 {message}
+app.MapPost("/api/auth/reset-password", async (ResetPasswordRequest request, AppDbContext db) =>
+{
+    // one answer for every bad-link case (unknown / used / replaced / expired / employee not active)
+    var invalidLink = Results.BadRequest(new { message = "This link is invalid or has expired. Please request a new one." });
+
+    // no token in the body -> bad link
+    if (string.IsNullOrEmpty(request.Token))
+        return invalidLink;
+
+    // token from the link -> the same SHA-256 hex as stored at forgot-password
+    var tokenHash = ResetTokens.Hash(request.Token);
+    // hash -> the matching row + its Employee (Include = load the employee in the same query), or null
+    var resetToken = await db.PasswordResetTokens
+        .Include(t => t.Employee)
+        .FirstOrDefaultAsync(t => t.TokenHash == tokenHash);
+
+    // not found / already used or replaced / expired / employee gone or not active -> bad link
+    if (resetToken is null
+        || resetToken.UsedAt != null
+        || resetToken.ExpiresAt <= DateTime.UtcNow
+        || resetToken.Employee is null
+        || !string.Equals(resetToken.Employee.Status, "active", StringComparison.OrdinalIgnoreCase))
+        return invalidLink;
+
+    // new password (null -> "") -> first broken rule as text, or null if all rules pass
+    var ruleError = PasswordRules.Validate(request.NewPassword ?? "");
+    // a rule is broken -> 400 with that rule's message (the link stays usable, the user can try again)
+    if (ruleError is not null)
+        return Results.BadRequest(new { message = ruleError });
+
+    // the employee this link belongs to (loaded by Include above)
+    var employee = resetToken.Employee;
+    // new password -> BCrypt hash (fresh salt) -> replaces the old hash
+    employee.Password = BCrypt.Net.BCrypt.HashPassword(request.NewPassword);
+    // the user chose this password himself -> no forced change at next login
+    employee.IsFirstLogin = false;
+    // reset also unlocks -> counter 0, no lock
+    employee.FailedLoginAttempts = 0;
+    employee.LockoutEnd = null;
+    // link -> used now (a second click = invalid)
+    resetToken.UsedAt = DateTime.UtcNow;
+    // employee changes + usedAt -> saved together (all or nothing)
+    await db.SaveChangesAsync();
+
+    // -> 200; React sends the user to Login (no automatic login)
+    return Results.Ok(new { message = "Your password has been reset. You can log in now." });
+})
+
+// rule "auth" -> max 10 per minute per IP
+.RequireRateLimiting("auth");
 
 // starts the server → waits for requests (stop with Ctrl+C)
 app.Run();

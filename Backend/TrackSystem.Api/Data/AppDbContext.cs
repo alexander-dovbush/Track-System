@@ -20,4 +20,7 @@ public class AppDbContext : DbContext
 
     // dbo.LoginLogs table -> collection of LoginLog objects we can add to and query
     public DbSet<LoginLog> LoginLogs => Set<LoginLog>();
+
+    // dbo.PasswordResetTokens table -> collection of PasswordResetToken objects (add / find by hash)
+    public DbSet<PasswordResetToken> PasswordResetTokens => Set<PasswordResetToken>();
 }
